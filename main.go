@@ -3,15 +3,21 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"net/http/pprof"
 	"os"
+	"os/user"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/microservices/api/debug"
+	defect "github.com/microservices/api/defects"
+	logs "github.com/microservices/api/logs"
+	ticket "github.com/microservices/api/tickets"
+	u "github.com/microservices/api/users"
+	version "github.com/microservices/api/version"
+	log "github.com/sirupsen/logrus"
 	"goji.io"
 	"goji.io/pat"
 	"golang.org/x/net/context"
@@ -31,60 +37,6 @@ func ResponseWithJSON(w http.ResponseWriter, json []byte, code int) {
 	w.Write(json)
 }
 
-type ITH struct {
-	State      string    `json:"state"`
-	Time       string    `json:"time"`
-	ISODate    time.Time `json:"isodate"`
-	ModifiedBy string    `json:"modifiedby"`
-	Activity   string    `json:"activity"`
-}
-type TicketLog struct {
-	Date    string    `json:"date"`
-	ISODate time.Time `json:"isodate"`
-	Info    string    `json:"info"`
-	User    string    `json:"user"`
-}
-type TicketParent struct {
-	Status     string    `json:"status"`
-	Sev        string    `json:"sev"`
-	Number     string    `json:"number"`
-	Created    string    `json:"created"`
-	ISOCreated time.Time `json:"isocreted"`
-}
-
-type Ticket struct {
-	Sev             string       `json:"sev"`
-	SubrootCause    string       `json:"subroot_cause"`
-	Opened          string       `json:"opened"`
-	ISOOpened       time.Time    `json:"isoopened"`
-	Parent          TicketParent `json:"parent"`
-	Handover        string       `json:"handover"`
-	Abstract        string       `json:"abstract"`
-	Number          string       `json:"number"`
-	LastModifiedBy  string       `json:"lastmodifiedby"`
-	State           string       `json:"state"`
-	LastModified    string       `json:"lastmodified"`
-	ISOLastModified time.Time    `json:"isolastmodified"`
-	Role            string       `json:"role"`
-	Dispatch        string       `json:"dispatch"`
-	ISOClosed       time.Time    `json:isoclosed`
-	Closed          string       `json:"closed"`
-	Owner           string       `json:"owner"`
-	RootCause       string       `json:"rootcause"`
-	Restored        string       `json:"restored"`
-	Ith             []ITH        `json:"ith"`
-	Logs            []TicketLog  `json:"logs"`
-}
-type User struct {
-	Name      string `json:"name"`
-	Is_Active bool   `json:"is_active"`
-	Real_Name string `json:"real_name"`
-	Current   bool   `json:"current"`
-	Is_Admin  bool   `json:"is_admin"`
-	ID        string `json:"id"`
-	Engineer  bool   `json:"engineer"`
-	Attuid    string `json:"attuid"`
-}
 type Field struct {
 	Num   string `json:"num"`
 	State string `json:"state"`
@@ -96,47 +48,38 @@ type jobs struct {
 	Tickets []Field `json:"tickets"`
 }
 
-type Defect struct {
-	Id   string   `bson:"_id"`
-	Info []string `json:"info"`
-}
-type DefectOutput struct {
-	Number  string `json:"number"`
-	Defects string `json:"defect"`
-}
+var logger *log.Entry
 
-func strToTime(ticket *Ticket) {
-	var err error
-	if ticket.ISOLastModified, err = time.Parse("2006-01-02 15:04:05", ticket.LastModified); err != nil {
-		log.Println("Last Modified: ", err)
-	}
-	if ticket.ISOClosed, err = time.Parse("01/02/2006 15:04", ticket.Closed); err != nil {
-		log.Println("Closed: ", err)
-	}
-	if ticket.ISOOpened, err = time.Parse("2006-01-02 15:04:05", ticket.Opened); err != nil {
-		log.Println("Opened: ", err)
-	}
-	if ticket.Parent.ISOCreated, err = time.Parse("2006-01-02 15:04:05", ticket.Parent.Created); err != nil {
-		log.Println("Parent created: ", err)
-	}
-	for i, _ := range ticket.Ith {
-		if ticket.Ith[i].ISODate, err = time.Parse("2006-01-02 15:04:05", ticket.Ith[i].Time); err != nil {
-			log.Println("ITH: ", err)
-		}
-	}
-	for i, _ := range ticket.Logs {
-		if ticket.Logs[i].ISODate, err = time.Parse("2006-01-02 15:04:05", ticket.Logs[i].Date); err != nil {
-			log.Println("Logs: ", err)
-		}
-	}
-}
 func main() {
 	host := os.Getenv("MONGO_HOST")
-	port := os.Getenv("MONGO_PORT")
-	mongo := host + ":" + port
-	session, err := mgo.Dial(mongo)
+	logLevel := os.Getenv("LOG_LEVEL")
+	port := os.Getenv("PORT")
+	profilePort := os.Getenv("PROFILE_PORT")
+	logger = logs.Logger("api", logLevel)
+	log.WithFields(log.Fields{
+		"service":  "api",
+		"event":    "starting",
+		"commit":   version.Commit,
+		"build":    version.BuildTime,
+		"release":  version.Release,
+		"logLevel": logLevel,
+		"mongodb":  host,
+		"port":     port,
+		"profile":  profilePort}).Info("Starting the API service...")
+
+	// host will have hostname:port
+	logger.Debug(host)
+
+	if host == "" {
+		logger.Fatal("MongoDB not set")
+	}
+	if port == "" {
+		logger.Fatal("Port not set")
+	}
+
+	session, err := mgo.Dial(host)
 	if err != nil {
-		panic(fmt.Sprintf("mongodb connection error %s", err))
+		logger.Fatal(err)
 	}
 	defer session.Close()
 	session.SetMode(mgo.Monotonic, true)
@@ -173,15 +116,38 @@ func main() {
 	//defects
 	mux.HandleFuncC(pat.Get("/api/defects"), searchDefects(session))
 	mux.HandleFuncC(pat.Get("/api/zones"), searchZones(session))
-	// debug
-	prof := http.NewServeMux()
-	prof.HandleFunc("/debug/pprof/", pprof.Index)
-	prof.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	prof.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	prof.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	prof.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	go http.ListenAndServe("0.0.0.0:8083", prof)
-	http.ListenAndServe("0.0.0.0:8080", mux)
+	if profilePort != "" {
+		prof := debug.Router()
+		go http.ListenAndServe(fmt.Sprintf("0.0.0.0:%s", profilePort), prof)
+	}
+
+	http.ListenAndServe(fmt.Sprintf("0.0.0.0:%s", port), mux)
+}
+
+func strToTime(ticket *ticket.Ticket) {
+	var err error
+	if ticket.ISOLastModified, err = time.Parse("2006-01-02 15:04:05", ticket.LastModified); err != nil {
+
+	}
+	if ticket.ISOClosed, err = time.Parse("01/02/2006 15:04", ticket.Closed); err != nil {
+		logger.Error(err)
+	}
+	if ticket.ISOOpened, err = time.Parse("2006-01-02 15:04:05", ticket.Opened); err != nil {
+		logger.Error(err)
+	}
+	if ticket.Parent.ISOCreated, err = time.Parse("2006-01-02 15:04:05", ticket.Parent.Created); err != nil {
+		logger.Error(err)
+	}
+	for i, _ := range ticket.Ith {
+		if ticket.Ith[i].ISODate, err = time.Parse("2006-01-02 15:04:05", ticket.Ith[i].Time); err != nil {
+			logger.Error(err)
+		}
+	}
+	for i, _ := range ticket.Logs {
+		if ticket.Logs[i].ISODate, err = time.Parse("2006-01-02 15:04:05", ticket.Logs[i].Date); err != nil {
+			logger.Error(err)
+		}
+	}
 }
 
 func ensureIndex(s *mgo.Session) {
@@ -210,7 +176,7 @@ func allTickets(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("info").C("tickets")
 
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		err := c.Find(bson.M{}).Sort("isoopened").All(&tickets)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -238,7 +204,7 @@ func activeTickets(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("info").C("tickets")
 
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		// db.tickets.find({"state": {$ne: "Closed"}}, {number:1, state:1, owner:1, sev:1})
 		err := c.Find(bson.M{"$and": []bson.M{bson.M{"state": bson.M{"$ne": "Cancel"}}, bson.M{"state": bson.M{"$ne": "Closed"}}}}).Select(sel("number", "owner", "sev", "state", "isoopened", "abstract", "isolastmodified")).Sort("isoopened").All(&tickets)
 		if err != nil {
@@ -263,7 +229,7 @@ func reportBacklogTickets(s *mgo.Session) goji.HandlerFunc {
 		}
 		c := session.DB("info").C("tickets")
 
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		//db.tickets.find({$and:[{isoclosed:{$gt:ISODate("2017-01-31T00:00:00.000Z")}}},{isoopened:{$lte:ISODate("2017-01-31T00:00:00.000Z")}}],{number:1,isoopened:1,isoclosed:1 })
 		err = c.Find(bson.M{"$and": []bson.M{bson.M{"$or": []bson.M{bson.M{"state": bson.M{"$ne": "Closed"}}, bson.M{"isoclosed": bson.M{"$gte": ISODate}}}}, bson.M{"isoopened": bson.M{"$lte": ISODate}}}}).Select(sel("number", "owner", "sev", "state", "isoopened", "abstract", "isoclosed")).Sort("isoopened").All(&tickets)
 		if err != nil {
@@ -284,7 +250,7 @@ func queuedTickets(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("info").C("tickets")
 
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		// db.tickets.find({"state": {$ne: "Closed"}}, {number:1, state:1, owner:1, sev:1})
 		err := c.Find(bson.M{"state": "Queued"}).Select(sel("number", "owner", "sev", "state", "isolastmodified", "abstract")).All(&tickets)
 		if err != nil {
@@ -339,7 +305,7 @@ func searchDefects(s *mgo.Session) goji.HandlerFunc {
 		c := session.DB("info").C("tickets")
 		re := regexp.MustCompile(`https://sdp.web.att.com\S{50,83}(/|=)[\d]{6}`)
 		defectNum := regexp.MustCompile(`[\d]{6}`)
-		var defects []Defect
+		var defects []defect.Defect
 
 		// add finding only not closed tickets
 		//		b.tickets.aggregate(
@@ -361,16 +327,16 @@ func searchDefects(s *mgo.Session) goji.HandlerFunc {
 			log.Println("Failed get report: ", err)
 			return
 		}
-		var resp []DefectOutput
+		var resp []defect.DefectOutput
 		// goroutine to increase spead
-		for _, defect := range defects {
-			var def DefectOutput
-			for _, l := range defect.Info {
+		for _, d := range defects {
+			var def defect.DefectOutput
+			for _, l := range d.Info {
 				s := strings.Replace(l, "\n", "", -1)
-				d := re.FindAllStringSubmatch(s, -1)
-				def.Number = defect.Id
-				for _, link := range d {
-					def.Number = defect.Id
+				out := re.FindAllStringSubmatch(s, -1)
+				def.Number = d.Id
+				for _, link := range out {
+					def.Number = d.Id
 					def.Defects = defectNum.FindString(string(link[0]))
 					resp = append(resp, def)
 				}
@@ -404,8 +370,8 @@ func searchZones(s *mgo.Session) goji.HandlerFunc {
 		ResponseWithJSON(w, respBody, http.StatusOK)
 	}
 }
-func removeDuplicatesUnordered(elements []DefectOutput) []DefectOutput {
-	encountered := map[DefectOutput]bool{}
+func removeDuplicatesUnordered(elements []defect.DefectOutput) []defect.DefectOutput {
+	encountered := map[defect.DefectOutput]bool{}
 
 	// Create a map of all unique elements.
 	for v := range elements {
@@ -413,7 +379,7 @@ func removeDuplicatesUnordered(elements []DefectOutput) []DefectOutput {
 	}
 
 	// Place all keys from the map into a slice.
-	result := []DefectOutput{}
+	result := []defect.DefectOutput{}
 	for key, _ := range encountered {
 		result = append(result, key)
 	}
@@ -439,7 +405,7 @@ func reportTickets(s *mgo.Session) goji.HandlerFunc {
 		//operations := []bson.M{project, match}
 		//pipe := c.Pipe(operations)
 		pipe := c.Pipe([]bson.M{{"$project": bson.M{"number": "$number", "owner": "$owner", "isoopened": "$isoopened", "state": "$state", "week": bson.M{"$week": "$isoopened"}, "year": bson.M{"$year": "$isoopened"}}}, {"$match": bson.M{"$and": []interface{}{bson.M{"week": week}, bson.M{"year": year}}}}})
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		err = pipe.All(&tickets)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -473,7 +439,7 @@ func reportClosedTickets(s *mgo.Session) goji.HandlerFunc {
 		//operations := []bson.M{project, match}
 		//pipe := c.Pipe(operations)
 		pipe := c.Pipe([]bson.M{{"$project": bson.M{"number": "$number", "owner": "$owner", "isoclosed": "$isoclosed", "week": bson.M{"$week": "$isoclosed"}, "year": bson.M{"$year": "$isoclosed"}}}, {"$match": bson.M{"$and": []interface{}{bson.M{"week": week}, bson.M{"year": year}}}}})
-		var tickets []Ticket
+		var tickets []ticket.Ticket
 		err = pipe.All(&tickets)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -491,7 +457,7 @@ func addTicket(s *mgo.Session) goji.HandlerFunc {
 		session := s.Copy()
 		defer session.Close()
 
-		var ticket Ticket
+		var ticket ticket.Ticket
 		decoder := json.NewDecoder(r.Body)
 		err := decoder.Decode(&ticket)
 		strToTime(&ticket)
@@ -528,7 +494,7 @@ func ticketByNumber(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("info").C("tickets")
 
-		var ticket Ticket
+		var ticket ticket.Ticket
 		err := c.Find(bson.M{"number": number}).One(&ticket)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -557,7 +523,7 @@ func updateTicket(s *mgo.Session) goji.HandlerFunc {
 		number := pat.Param(ctx, "number")
 
 		var (
-			ticket Ticket
+			ticket ticket.Ticket
 			err    error
 		)
 		//requestDump, err := httputil.DumpRequest(r, true)
@@ -622,7 +588,7 @@ func allUsers(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 
-		var users []User
+		var users []user.User
 		err := c.Find(bson.M{"engineer": true}).All(&users)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -644,7 +610,7 @@ func activeUsers(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 
-		var users []User
+		var users []user.User
 		err := c.Find(bson.M{"$and": []bson.M{bson.M{"is_active": true}, bson.M{"engineer": true}}}).All(&users)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -665,7 +631,7 @@ func blacklistedUsers(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 
-		var users []User
+		var users []user.User
 		err := c.Find(bson.M{"$and": []bson.M{bson.M{"is_active": false}, bson.M{"engineer": true}}}).All(&users)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -686,7 +652,7 @@ func adminsUsers(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 
-		var users []User
+		var users []user.User
 		err := c.Find(bson.M{"is_admin": true}).All(&users)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -707,7 +673,7 @@ func getUser(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 		uid := pat.Param(ctx, "uid")
-		var user User
+		var user user.User
 		err := c.Find(bson.M{"id": uid}).One(&user)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -728,7 +694,7 @@ func currentUser(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 
-		var user User
+		var user user.User
 		err := c.Find(bson.M{"current": true}).One(&user)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -750,7 +716,7 @@ func updateUser(s *mgo.Session) goji.HandlerFunc {
 		uid := pat.Param(ctx, "uid")
 
 		var (
-			user User
+			user u.User
 			err  error
 		)
 		decoder := json.NewDecoder(r.Body)
@@ -783,7 +749,7 @@ func deleteUser(s *mgo.Session) goji.HandlerFunc {
 		uid := pat.Param(ctx, "uid")
 
 		c := session.DB("users").C("users")
-		var user User
+		var user u.User
 		err := c.Find(bson.M{"id": uid}).One(&user)
 		if err != nil {
 			switch err {
@@ -825,7 +791,7 @@ func nextUser(s *mgo.Session) goji.HandlerFunc {
 		session := s.Copy()
 		defer session.Close()
 		c := session.DB("users").C("users")
-		var users []User
+		var users []u.User
 		err := c.Find(bson.M{"$and": []bson.M{bson.M{"is_active": true}, bson.M{"engineer": true}}}).All(&users)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -878,7 +844,7 @@ func whitelistUser(s *mgo.Session) goji.HandlerFunc {
 		uid := pat.Param(ctx, "uid")
 
 		var (
-			user User
+			user u.User
 			err  error
 		)
 		c := session.DB("users").C("users")
@@ -917,7 +883,7 @@ func blacklistUser(s *mgo.Session) goji.HandlerFunc {
 		uid := pat.Param(ctx, "uid")
 
 		var (
-			user User
+			user u.User
 			err  error
 		)
 		c := session.DB("users").C("users")
@@ -959,7 +925,7 @@ func isAdmin(s *mgo.Session) goji.HandlerFunc {
 		uid := pat.Param(ctx, "uid")
 
 		var (
-			user User
+			user u.User
 			err  error
 		)
 		c := session.DB("users").C("users")
@@ -984,7 +950,7 @@ func addUser(s *mgo.Session) goji.HandlerFunc {
 		var (
 			err error
 		)
-		var user User
+		var user u.User
 		decoder := json.NewDecoder(r.Body)
 		err = decoder.Decode(&user)
 		if err != nil {
@@ -1015,7 +981,7 @@ func getAttUser(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("users").C("users")
 		attuid := pat.Param(ctx, "attuid")
-		var user User
+		var user u.User
 		err := c.Find(bson.M{"attuid": attuid}).One(&user)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -1036,15 +1002,15 @@ func addDefect(s *mgo.Session) goji.HandlerFunc {
 		var (
 			err error
 		)
-		var defect DefectOutput
+		var d defect.DefectOutput
 		decoder := json.NewDecoder(r.Body)
-		err = decoder.Decode(&defect)
+		err = decoder.Decode(&d)
 		if err != nil {
 			ErrorWithJSON(w, "Incorrect body", http.StatusBadRequest)
 			return
 		}
 		c := session.DB("info").C("defect")
-		err = c.Insert(defect)
+		err = c.Insert(d)
 		if err != nil {
 			if mgo.IsDup(err) {
 				ErrorWithJSON(w, "Defect is already exists", http.StatusBadRequest)
@@ -1056,7 +1022,7 @@ func addDefect(s *mgo.Session) goji.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Location", r.URL.Path+"/"+defect.Defects)
+		w.Header().Set("Location", r.URL.Path+"/"+d.Defects)
 		w.WriteHeader(http.StatusCreated)
 	}
 }
@@ -1067,14 +1033,14 @@ func getDefect(s *mgo.Session) goji.HandlerFunc {
 
 		c := session.DB("info").C("defect")
 		id := pat.Param(ctx, "defect")
-		var defect DefectOutput
-		err := c.Find(bson.M{"defects": id}).One(&defect)
+		var d defect.DefectOutput
+		err := c.Find(bson.M{"defects": id}).One(&d)
 		if err != nil {
 			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
 			return
 		}
 
-		respBody, err := json.MarshalIndent(defect, "", "  ")
+		respBody, err := json.MarshalIndent(d, "", "  ")
 		if err != nil {
 			log.Println(err)
 		}
